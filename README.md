@@ -3,7 +3,7 @@ This is the repository for our CV final project, we introduce dynamic attention 
 
 
 ## Visual Results
-the visual results are in our technical report. Alos the reuslt folder contains some of the results.
+the visual results are in our technical report. Also the reuslt folder contains some of the results.
 
 ## Requirement
 ```

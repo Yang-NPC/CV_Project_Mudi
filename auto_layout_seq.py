@@ -1,19 +1,20 @@
-"""Simple sequential layout generator using Qwen2.5-VL.
+"""Sequential layout generation with Qwen2.5-VL.
 
 Flow:
-- Ask VL model to list noun-only subjects (count = num_images).
-- For each subject in order, render the current layout, send the image + coords to the VL model, and ask for one box.
-- Save final layout preview and print JSON with phrases/boxes.
+- Ask VL for subject list (noun-only, count = num_images).
+- For each subject i:
+    * Render current boxes to an image.
+    * Send image + existing coords + prompt to VL and request ONE box.
+- Draw final layout and print JSON.
 
-Dependencies:
-    pip install "transformers>=4.45" qwen-vl-utils matplotlib pillow
+Deps: pip install "transformers>=4.45" qwen-vl-utils matplotlib pillow
 
-Usage example:
-    python auto_layout_from_qwen.py \
-        --prompt "a dog wearing the hat and sitting next to one cat in the garden" \
-        --num-images 3 \
-        --model /home/zchengay/Model/qwen2.5 \
-        --output scheduler_plots/qwen_layout_preview.png
+Usage:
+    python auto_layout_seq.py \
+      --prompt "a dog wearing the hat and sitting next to one cat in the garden" \
+      --num-images 3 \
+      --model /home/zchengay/Model/qwen2.5 \
+      --output scheduler_plots/qwen_layout_seq.png
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import matplotlib.pyplot as plt
 import torch
@@ -46,25 +47,6 @@ def load_vl_model(model_path: str):
     )
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     return model, processor
-
-
-def clamp_box(box: List[float], min_side: float = 0.12) -> List[float]:
-    x1, y1, x2, y2 = box
-    x1 = max(0.0, min(1.0, x1))
-    y1 = max(0.0, min(1.0, y1))
-    x2 = max(0.0, min(1.0, x2))
-    y2 = max(0.0, min(1.0, y2))
-    if x2 <= x1:
-        x2 = min(1.0, x1 + min_side)
-    if y2 <= y1:
-        y2 = min(1.0, y1 + min_side)
-    w = x2 - x1
-    h = y2 - y1
-    if w < min_side:
-        x2 = min(1.0, x1 + min_side)
-    if h < min_side:
-        y2 = min(1.0, y1 + min_side)
-    return [max(0.0, min(1.0, x1)), max(0.0, min(1.0, y1)), max(0.0, min(1.0, x2)), max(0.0, min(1.0, y2))]
 
 
 def draw_layout(phrases: List[str], boxes: List[List[float]], width: int, height: int, save_path: Path) -> Path:
@@ -104,6 +86,14 @@ def draw_layout(phrases: List[str], boxes: List[List[float]], width: int, height
     return save_path
 
 
+def extract_json_block(response: str) -> Dict[str, Any]:
+    start = response.find("{")
+    end = response.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found")
+    return json.loads(response[start : end + 1])
+
+
 def chat_vl(messages: List[Dict[str, Any]], model, processor, max_new_tokens: int, temperature: float) -> str:
     chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
@@ -128,14 +118,6 @@ def chat_vl(messages: List[Dict[str, Any]], model, processor, max_new_tokens: in
     return response.strip()
 
 
-def extract_json_block(response: str) -> Dict[str, Any]:
-    start = response.find("{")
-    end = response.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found")
-    return json.loads(response[start : end + 1])
-
-
 def get_subjects(prompt: str, num_images: int, model, processor, max_new_tokens: int, temperature: float) -> List[str]:
     messages = [
         {
@@ -157,15 +139,12 @@ def get_subjects(prompt: str, num_images: int, model, processor, max_new_tokens:
     return subjects
 
 
-def place_subject(prompt: str, subject: str, idx: int, existing: List[List[float]], phrases: List[str], image_path: Path, model, processor, max_new_tokens: int, temperature: float) -> List[float]:
-    desc_existing = [f"{phrases[i]}: {existing[i]}" for i in range(len(existing))] or ["none"]
+def place_one(prompt: str, subject: str, idx: int, existing_boxes: List[List[float]], phrases: List[str], image_path: Path, model, processor, max_new_tokens: int, temperature: float) -> List[float]:
+    desc_existing = [f"{phrases[i]}: {existing_boxes[i]}" for i in range(len(existing_boxes))] or ["none"]
     messages = [
         {
             "role": "system",
-            "content": (
-                "Given the current image and existing boxes, add ONE box for the requested subject. "
-                "Return ONLY JSON: {\"box\": [x1,y1,x2,y2]} with coords in [0,1]. Avoid heavy overlap."
-            ),
+            "content": "Given the image and existing boxes, add ONE box for the subject. Return ONLY JSON {\"box\": [x1,y1,x2,y2]} in [0,1]. Avoid heavy overlap.",
         },
         {
             "role": "user",
@@ -174,7 +153,7 @@ def place_subject(prompt: str, subject: str, idx: int, existing: List[List[float
                 {
                     "type": "text",
                     "text": (
-                        f"Instruction: {prompt}\n" f"Existing boxes: {desc_existing}\n" f"Place subject #{idx + 1}: '{subject}'."
+                        f"Instruction: {prompt}\nExisting boxes: {desc_existing}\nPlace subject #{idx + 1}: '{subject}'."
                     ),
                 },
             ],
@@ -187,7 +166,12 @@ def place_subject(prompt: str, subject: str, idx: int, existing: List[List[float
     if not box:
         raise ValueError("No box returned")
     x1, y1, x2, y2 = [float(v) for v in box]
-    return clamp_box([x1, y1, x2, y2], min_side=0.12 if "hat" not in subject else 0.08)
+    # clamp to [0,1]
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    x2 = max(0.0, min(1.0, x2))
+    y2 = max(0.0, min(1.0, y2))
+    return [x1, y1, x2, y2]
 
 
 def main():
@@ -195,7 +179,7 @@ def main():
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--num-images", type=int, required=True)
     parser.add_argument("--model", type=str, default="/home/zchengay/Model/qwen2.5")
-    parser.add_argument("--output", type=Path, default=Path("scheduler_plots/qwen_layout_preview.png"))
+    parser.add_argument("--output", type=Path, default=Path("scheduler_plots/qwen_layout_seq.png"))
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -221,16 +205,16 @@ def main():
         box = None
         feedback = ""
         for _ in range(args.max_attempts):
-            tmp_img = args.output.parent / f"step_{idx}.png"
-            draw_layout(phrases[: len(boxes)], boxes, args.width, args.height, tmp_img)
+            step_img = args.output.parent / f"step_{idx}.png"
+            draw_layout(phrases[: len(boxes)], boxes, args.width, args.height, step_img)
             try:
-                box_candidate = place_subject(
+                box_candidate = place_one(
                     prompt=args.prompt if not feedback else f"{args.prompt}\nPrevious issue: {feedback}",
                     subject=subject or f"subject_{idx}",
                     idx=idx,
-                    existing=boxes,
+                    existing_boxes=boxes,
                     phrases=phrases,
-                    image_path=tmp_img,
+                    image_path=step_img,
                     model=model,
                     processor=processor,
                     max_new_tokens=args.max_new_tokens,
