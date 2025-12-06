@@ -14,9 +14,9 @@ class MUSE_pipeline(torch.nn.Module):
     def __init__(self, muse_ckpt):
         super().__init__()
         #https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0
-        base_model_path = "./SDXL"
+        base_model_path = "/home/zchengay/Model/sdxl-base"
         # https://huggingface.co/laion/CLIP-ViT-bigG-14-laion2B-39B-b160k
-        image_encoder_path = "./CLIP"
+        image_encoder_path = "/home/zchengay/Model/CLIP-G"
         
         self.device = "cuda"
         self.image_processor = CLIPImageProcessor()
@@ -28,6 +28,7 @@ class MUSE_pipeline(torch.nn.Module):
             add_watermarker=False,
         )
         self.pipe.to(self.device)
+        
         
         num_tokens_image = 4
         num_tokens_text = 1
@@ -79,16 +80,16 @@ class MUSE_pipeline(torch.nn.Module):
         return images
 
 if __name__ == "__main__":
-    muse_ckpt = "./muse_weight.pth"
+    muse_ckpt = "/home/zchengay/Model/MUSE/muse_weight.pth"
     num_tokens = 4
-    log_id = f'inference3'
-    result_path="result"
+    log_id = f'inference'
+    result_path="/home/zchengay/CV/MUSE/result"
     pipeline = MUSE_pipeline(muse_ckpt)
 
     seed_everything(0)
 
-    imgs = ["imgs/cat1.jpg", "imgs/dog1.jpg", "imgs/dog2.jpg"]
-    phrases = [["cat", "dog", "dog"]]
+    imgs = [ "/home/zchengay/CV/MUSE/imgs/dog1.jpg", "/home/zchengay/CV/MUSE/imgs/dog2.jpg", "/home/zchengay/CV/MUSE/imgs/cat1.jpg",]
+    phrases = [["dog", "dog", "cat"]]
     boxes = [[[0.1, 0.1, 0.55, 0.6], [0.45, 0.3, 0.75, 0.6], [0.7, 0.4, 0.9, 0.6]]]
     prompt = "a photo of a cat , a dog and a dog."
     save_img_name = prompt

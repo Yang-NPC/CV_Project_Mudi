@@ -6,10 +6,12 @@ import torch
 
 from adapter_modules.attention_processor import AttnProcessor
 from adapter_modules.attention_processor import MUSE_AttnProcessor
+from adapter_modules.utils import debug_predict_x0
 
 class MuseAdapter(torch.nn.Module):
     def __init__(self, unet, image_proj_model, adapter_modules=None, ckpt_path=None,
-                num_tokens=4, text_tokens=77, device="cuda", controlnet=None):
+                num_tokens=4, text_tokens=77, device="cuda", controlnet=None, 
+                dynamic_scale=False, scale_schedule="linear"):
         super().__init__()
         self.unet = unet
         self.image_proj_model = image_proj_model
@@ -19,9 +21,14 @@ class MuseAdapter(torch.nn.Module):
         self.device = device
         self.controlnet = controlnet
         self.cross_attention_dim = self.unet.config.cross_attention_dim
+        self.dynamic_scale = dynamic_scale
+        self.scale_schedule = scale_schedule
+        self.current_num_inference_steps = None
+        self._unet_pre_hook_handle = None
+        self._step_counter = 0
 
         if self.adapter_modules is None:
-            self.set_muse_adapter()
+            self.set_muse_adapter(dynamic_scale=self.dynamic_scale, scale_schedule=self.scale_schedule)
 
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
@@ -48,7 +55,7 @@ class MuseAdapter(torch.nn.Module):
 
 
 
-    def set_muse_adapter(self, weight_dtype=torch.float16, cache_attention_maps=True):
+    def set_muse_adapter(self, weight_dtype=torch.float16, cache_attention_maps=True, dynamic_scale=False, scale_schedule="linear"):
         # set attention processor
         attn_procs = {}
         for name in self.unet.attn_processors.keys():
@@ -75,16 +82,45 @@ class MuseAdapter(torch.nn.Module):
                                                 num_object=10,
                                                 num_tokens_text=1, #1
                                                 num_tokens_image=4, #4
-                                                stage=2).to(self.device, dtype=weight_dtype)
+                                                stage=2,
+                                                dynamic_scale=dynamic_scale,
+                                                scale_schedule=scale_schedule).to(self.device, dtype=weight_dtype)
 
         self.unet.set_attn_processor(attn_procs)
         self.adapter_modules = torch.nn.ModuleList(self.unet.attn_processors.values())
+        self._ensure_timestep_hook()
         if self.controlnet is not None:
             if isinstance(self.controlnet, MultiControlNetModel):
                 for controlnet in self.controlnet.nets:
                     controlnet.set_attn_processor(CNAttnProcessor(text_tokens=self.text_tokens, num_tokens=self.num_tokens))
             else:
                 self.controlnet.set_attn_processor(CNAttnProcessor(text_tokens=self.text_tokens, num_tokens=self.num_tokens))
+
+    def _ensure_timestep_hook(self):
+        if not self.dynamic_scale:
+            return
+        if self._unet_pre_hook_handle is not None:
+            return
+
+        def _pre_hook(module, inputs):
+            if not self.dynamic_scale:
+                return
+            if len(inputs) < 2:
+                return
+            timestep = inputs[1]
+            self._update_processor_timestep(timestep)
+
+        self._unet_pre_hook_handle = self.unet.register_forward_pre_hook(_pre_hook)
+
+    def _update_processor_timestep(self, timestep):
+        timestep_value = float(self._step_counter)
+        self._step_counter += 1
+
+        for attn_processor in self.unet.attn_processors.values():
+            if isinstance(attn_processor, MUSE_AttnProcessor):
+                attn_processor.current_timestep = timestep_value
+                if self.current_num_inference_steps is not None:
+                    attn_processor.num_inference_steps = self.current_num_inference_steps
 
     @torch.inference_mode()
     def get_image_embeds(self, processed_images, image_encoder=None, weight_dtype=torch.float16):
@@ -118,9 +154,13 @@ class MuseAdapter(torch.nn.Module):
                 image_encoder=None, weight_dtype=torch.float16,
                 boxes=None, phrases=None, height=1024, width=1024, subject_scales=None,
                 max_box_num = None, masks = None, text_masks = None, image_masks = None,
+                debug_predict_step=None, debug_save_dir=None,
                 **kwargs):
 
         self.pipe = pipe
+        self.current_num_inference_steps = num_inference_steps
+        self._step_counter = 0
+        self._ensure_timestep_hook()
         self.set_scale(scale, subject_scales)
 
         bsz = len(boxes)  
@@ -232,8 +272,72 @@ class MuseAdapter(torch.nn.Module):
             prompt_embeds = prompt_embeds_
             negative_prompt_embeds = negative_prompt_embeds_
 
+            debug_prompt_embeds = None
+            debug_pooled_prompt_embeds = None
+            debug_time_ids = None
+            if debug_predict_step is not None and debug_save_dir is not None:
+                debug_prompt_embeds, _, debug_pooled_prompt_embeds, _ = pipe.encode_prompt(
+                    prompt,
+                    device=self.device,
+                    num_images_per_prompt=num_samples,
+                    do_classifier_free_guidance=False,
+                )
+                if pipe.text_encoder_2 is None:
+                    text_encoder_projection_dim = int(debug_pooled_prompt_embeds.shape[-1])
+                else:
+                    text_encoder_projection_dim = pipe.text_encoder_2.config.projection_dim
+                debug_time_ids = pipe._get_add_time_ids(
+                    original_size=(height, width),
+                    crops_coords_top_left=(0, 0),
+                    target_size=(height, width),
+                    dtype=debug_prompt_embeds.dtype,
+                    text_encoder_projection_dim=text_encoder_projection_dim,
+                )
+                debug_time_ids = debug_time_ids.to(self.device, dtype=debug_prompt_embeds.dtype)
+                debug_time_ids = debug_time_ids.repeat(debug_prompt_embeds.shape[0], 1)
+                debug_prompt_embeds = debug_prompt_embeds.to(self.device)
+                debug_pooled_prompt_embeds = debug_pooled_prompt_embeds.to(self.device)
+
 
         generator = torch.Generator(self.device).manual_seed(seed) if seed is not None else None
+
+        callback_fn = None
+        callback_inputs = None
+        if debug_predict_step is not None and debug_save_dir is not None and debug_prompt_embeds is not None:
+            os.makedirs(debug_save_dir, exist_ok=True)
+            debug_state = {"done": False}
+
+            def _debug_callback(pipe_, step, timestep, callback_kwargs):
+                if debug_state["done"] or step != debug_predict_step:
+                    return callback_kwargs
+                latents = callback_kwargs["latents"].detach()
+                sigmas = pipe_.scheduler.sigmas.to(latents.device)
+                prediction_type = getattr(pipe_.scheduler.config, "prediction_type", "v_prediction")
+                cond = {
+                    "encoder_hidden_states": debug_prompt_embeds,
+                    "added_cond_kwargs": {
+                        "text_embeds": debug_pooled_prompt_embeds,
+                        "time_ids": debug_time_ids.to(latents.device),
+                    },
+                }
+                sigma_index = min(step + 1, len(sigmas) - 1)
+                debug_predict_x0(
+                    model=pipe_.unet,
+                    vae=pipe_.vae,
+                    x_t=latents,
+                    t_idx=sigma_index,
+                    sigmas=sigmas,
+                    timesteps=pipe_.scheduler.timesteps.to(latents.device),
+                    cond=cond,
+                    save_dir=debug_save_dir,
+                    prediction_type=prediction_type,
+                )
+                debug_state["done"] = True
+                return callback_kwargs
+
+            callback_fn = _debug_callback
+            callback_inputs = ["latents"]
+
         images = pipe(
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -245,6 +349,8 @@ class MuseAdapter(torch.nn.Module):
             cross_attention_kwargs=cross_attention_kwargs,
             height=height,
             width=width,
+            callback_on_step_end=callback_fn,
+            callback_on_step_end_tensor_inputs=callback_inputs,
             **kwargs,
         ).images
 

@@ -21,6 +21,10 @@ class MUSE_AttnProcessor(nn.Module):
             The context length of the image features.
         num_tokens_text (`int`, defaults to 10):
             The number of the subjects.
+        dynamic_scale (`bool`, defaults to False):
+            Whether to use dynamic scaling based on diffusion timesteps.
+        scale_schedule (`str`, defaults to "linear"):
+            Schedule for dynamic scaling: "static", "linear", "cosine", "exponential", "reverse_linear", "increasing", or "decreasing".
     """
 
     def __init__(
@@ -32,7 +36,9 @@ class MUSE_AttnProcessor(nn.Module):
         num_object=10,
         num_tokens_text=1,
         num_tokens_image=1,
-        stage=1
+        stage=1,
+        dynamic_scale=False,
+        scale_schedule="linear"
     ):
 
         super().__init__()
@@ -43,6 +49,10 @@ class MUSE_AttnProcessor(nn.Module):
         self.num_tokens_text = num_tokens_text
         self.num_tokens_image = num_tokens_image
         self.stage = stage
+        self.dynamic_scale = dynamic_scale
+        self.scale_schedule = scale_schedule
+        self.current_timestep = None
+        self.num_inference_steps = 30
 
         self.to_k_text = nn.Linear(text_in_dim, hidden_size, bias=False)
         self.to_v_text = nn.Linear(text_in_dim, hidden_size, bias=False)
@@ -54,6 +64,50 @@ class MUSE_AttnProcessor(nn.Module):
             self.to_k_image = nn.Linear(image_in_dim or hidden_size, hidden_size, bias=False)
             self.to_v_image = nn.Linear(image_in_dim or hidden_size, hidden_size, bias=False)
 
+    def _compute_dynamic_scale(self, timestep, num_inference_steps=30):
+        """Compute dynamic scale based on timestep and schedule."""
+        if timestep is None or not self.dynamic_scale:
+            return self.scale
+        if num_inference_steps is None or num_inference_steps <= 0:
+            num_inference_steps = 30
+        
+        # Normalize timestep to [0, 1] range
+        t_norm = max(0.0, min(1.0, timestep / num_inference_steps))
+
+        # Helper to keep outputs in [0, 1]
+        def clamp01(val):
+            return max(0.0, min(1.0, val))
+
+        if self.scale_schedule == "static":
+            schedule_value = 0.5
+        elif self.scale_schedule == "linear":
+            schedule_value = 1.0 - t_norm
+        elif self.scale_schedule == "cosine":
+            import math
+            schedule_value = 0.5 * (1.0 + math.cos(math.pi * t_norm))
+        elif self.scale_schedule == "exponential":
+            import math
+            schedule_value = math.exp(-2.0 * t_norm)
+        elif self.scale_schedule == "reverse_linear":
+            schedule_value = t_norm
+        elif self.scale_schedule == "increasing":
+            import math
+            schedule_value = 1.0 - math.exp(-3.0 * t_norm)
+        elif self.scale_schedule == "decreasing":
+            import math
+            schedule_value = math.exp(-3.0 * t_norm)
+        else:
+            schedule_value = 1.0 - t_norm
+
+        schedule_value = clamp01(schedule_value)
+
+        # Keep scale changes gentle around the author-recommended base (e.g., 0.8)
+        # Final scale stays within ~[0.75x, 1.25x] of the base scale
+        scale_factor = 0.75 + 0.5 * schedule_value
+        dynamic_scale = self.scale * scale_factor
+
+        return max(dynamic_scale, 0.0)
+
 
     def __call__(
         self,
@@ -64,6 +118,7 @@ class MUSE_AttnProcessor(nn.Module):
         temb=None,
         text_box_grounding_embeds = None,
         image_box_grounding_embeds = None,
+        timestep=None,
     ):
 
         if encoder_hidden_states is None:
@@ -127,7 +182,11 @@ class MUSE_AttnProcessor(nn.Module):
             hidden_states_grounding_image = torch.bmm(attention_probs_image, value_image)
             hidden_states_grounding_image = attn.batch_to_head_dim(hidden_states_grounding_image)
 
-            hidden_states = hidden_states + self.scale * hidden_states_grounding_image
+            # Use dynamic scale based on timestep
+            timestep_value = timestep if timestep is not None else self.current_timestep
+            num_steps = getattr(self, "num_inference_steps", None)
+            current_scale = self._compute_dynamic_scale(timestep_value, num_steps)
+            hidden_states = hidden_states + current_scale * hidden_states_grounding_image
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
