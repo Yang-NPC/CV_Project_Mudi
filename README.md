@@ -2,6 +2,9 @@
 This is the repository for our CV final project, we introduce dynamic attention scheduling and automatic pipeline to further improve the multi-subject generation quality based on the MUSE repo.
 
 
+## Visual Results
+the visual results are in our technical report. Alos the reuslt folder contains some of the results.
+
 ## Requirement
 ```
 conda create -n DAS python=3.9.25
